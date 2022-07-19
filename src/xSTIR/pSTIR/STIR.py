@@ -323,6 +323,17 @@ class ImageData(SIRF.ImageData):
         """See DataContainer method."""
         return ImageData()
 
+    def modality(self):
+        """Returns imaging modality as Python string."""
+        return parms.char_par(self.handle, 'ImageData', 'modality')
+
+    def set_modality(self, mod):
+        """Sets imaging modality.
+
+        mod: "PT" or "NM" or "MR" or "CT" or "US" or "Optical"
+        """
+        return parms.set_char_par(self.handle, 'ImageData', 'modality', mod)
+
     def initialise(self, dim, vsize=(1., 1., 1.), origin=(0., 0., 0.)):
         """
         Sets image size and geometric information.
@@ -431,7 +442,7 @@ class ImageData(SIRF.ImageData):
         """Returns image dimensions as a tuple (nz, ny, nx)."""
         if self.handle is None:
             raise AssertionError()
-        dim = numpy.ndarray((MAX_IMG_DIMS,), dtype=numpy.int32)
+        dim = numpy.ndarray((MAX_IMG_DIMS,), dtype=cpp_int_dtype())
         try_calling(
             pystir.cSTIR_getImageDimensions(self.handle, dim.ctypes.data))
         return tuple(dim[:3])  # [::-1])
@@ -549,7 +560,7 @@ class ImageData(SIRF.ImageData):
             raise error('zoom_image: size should be tuple')
         np_zooms = numpy.asarray(zooms, dtype=numpy.float32)
         np_offsets_in_mm = numpy.asarray(offsets_in_mm, dtype=numpy.float32)
-        np_size = numpy.asarray(size, dtype=numpy.int32)
+        np_size = numpy.asarray(size, dtype=cpp_int_dtype())
 
         try_calling(pystir.cSTIR_ImageData_zoom_image(
             zoomed_im.handle, np_zooms.ctypes.data,
@@ -793,6 +804,69 @@ class RayTracingMatrix(object):
         parms.set_bool_par(self.handle, self.name, 'do_symmetry_shift_z', value)
         return self
 
+class SPECTUBMatrix:
+    '''
+    Class for objects holding sparse matrix representation of a SPECT
+    projector (developed at the University of Barcelona) (see AcquisitionModel class).
+    '''
+    name = 'SPECTUBMatrix'
+
+    def __init__(self):
+        '''
+        Create a new matrix. Default settings use neither attenuation nor resolution modelling.
+        '''
+        self.handle = pystir.cSTIR_newObject(self.name)
+        check_status(self.handle)
+
+    def __del__(self):
+        if self.handle is not None:
+            pyiutil.deleteDataHandle(self.handle)
+    def set_keep_all_views_in_cache(self, value):
+        '''
+        Enable keeping the matrix in memory.
+
+        This speeds-up the calculations, but can use a lot of memory.
+
+        You have to call set_up() after this (unless the value didn't change).
+        '''
+        parms.set_int_par(self.handle, self.name, 'keep_all_views_in_cache', value)
+        return self
+    def get_keep_all_views_in_cache(self):
+        '''
+        Returns a bool checking if we're keeping the whole matrix in memory or not.
+        '''
+        return parms.int_par(self.handle, self.name, 'keep_all_views_in_cache') != 0
+    def set_attenuation_image(self, value):
+        '''
+        Sets the attenuation image used by the projector.
+        '''
+        assert_validity(value, ImageData)
+        parms.set_parameter(self.handle, self.name, 'attenuation_image', value.handle)
+        return self
+    def get_attenuation_image(self):
+        '''
+        Returns the attenuation image used by the projector.
+        '''
+        image = ImageData()
+        image.handle = parms.parameter_handle(self.handle, self.name, 'attenuation_image')
+        return image
+
+    def set_resolution_model(self, collimator_sigma_0_in_mm, collimator_slope_in_mm, full_3D = True):
+        '''
+        Set the parameters for the depth-dependent resolution model
+
+        The detector and collimator blurring is modelled as a Gaussian with sigma dependent on the
+        distance from the collimator.
+
+        sigma_at_depth = collimator_slope * depth_in_mm + collimator sigma 0
+
+        Set slope and sigma_0 to zero to avoid resolution modelling.
+
+        You have to call set_up() after this.
+        '''
+        try_calling(pystir.cSTIR_SPECTUBMatrixSetResolution(self.handle, collimator_sigma_0_in_mm, collimator_slope_in_mm, full_3D))
+
+
 class AcquisitionData(DataContainer):
     """Class for PET acquisition data."""
 
@@ -919,7 +993,7 @@ class AcquisitionData(DataContainer):
         """
         if self.handle is None:
             raise AssertionError()
-        dim = numpy.ndarray((MAX_IMG_DIMS,), dtype=numpy.int32)
+        dim = numpy.ndarray((MAX_ACQ_DIMS,), dtype=cpp_int_dtype())
         try_calling(pystir.cSTIR_getAcquisitionDataDimensions(
             self.handle, dim.ctypes.data))
         dim = dim[:4]
@@ -1458,10 +1532,15 @@ class AcquisitionModel(object):
         self.acq_templ = acq_templ
         self.img_templ = img_templ
 
-    def norm(self, subset_num=0, num_subsets=1):
+    def norm(self, subset_num=0, num_subsets=1, num_iter=2, verb=0):
+        """Computes the norm of a part the linear operator S G.
+
+        See the docstring for method forward for the desciption of
+        the partial forward projection and the arguments.
+        """
         assert self.handle is not None
         handle = pystir.cSTIR_acquisitionModelNorm \
-                 (self.handle, subset_num, num_subsets)
+                 (self.handle, subset_num, num_subsets, num_iter, verb)
         check_status(handle)
         r = pyiutil.floatDataFromHandle(handle)
         pyiutil.deleteDataHandle(handle)
@@ -1774,7 +1853,7 @@ class AcquisitionModelUsingMatrix(AcquisitionModel):
         check_status(self.handle)
         if matrix is None:
             matrix = RayTracingMatrix()
-        parms.set_parameter(self.handle, self.name, 'matrix', matrix.handle)
+        self.set_matrix(matrix)
 
     def __del__(self):
         """del."""
@@ -1782,10 +1861,15 @@ class AcquisitionModelUsingMatrix(AcquisitionModel):
             pyiutil.deleteDataHandle(self.handle)
 
     def set_matrix(self, matrix):
-        """Sets the matrix G to be used for projecting.
-
-        matrix: an object to represent G in (F).
-        """
+        '''
+        Sets the matrix G to be used for projecting;
+        matrix:  a matrix object to represent G in acquisition model (F).
+        '''
+        # TODO will need to allow for different matrices here
+        try:
+            assert_validity(matrix, SPECTUBMatrix)
+        except:
+            assert_validity(matrix, RayTracingMatrix)
         parms.set_parameter(self.handle, self.name, 'matrix', matrix.handle)
 
 
@@ -1919,6 +2003,12 @@ class Prior(object):
         if self.handle is not None:
             pyiutil.deleteDataHandle(self.handle)
 
+    def __call__(self, image):
+        '''Returns the prior value on the specified image (alias of value()).
+
+        image: ImageData object'''
+        return self.value(image)
+
     def set_penalisation_factor(self, value):
         """Sets penalisation factor.
 
@@ -1934,6 +2024,23 @@ class Prior(object):
         return parms.float_par(
             self.handle, 'GeneralisedPrior', 'penalisation_factor')
 
+    def get_value(self, image):
+        """Returns the value of the prior.
+
+        Returns the value of the prior for the specified image.
+        image: ImageData object
+        """
+        assert_validity(image, ImageData)
+        handle = pystir.cSTIR_priorValue(self.handle, image.handle)
+        check_status(handle)
+        v = pyiutil.floatDataFromHandle(handle)
+        pyiutil.deleteDataHandle(handle)
+        return v
+
+    def value(self, image):
+        """Returns the value of the prior (alias of get_value())."""
+        return self.get_value(image)
+
     def get_gradient(self, image):
         """Returns gradient of the prior.
 
@@ -1945,6 +2052,11 @@ class Prior(object):
         grad.handle = pystir.cSTIR_priorGradient(self.handle, image.handle)
         check_status(grad.handle)
         return grad
+
+    def gradient(self, image):
+        """Returns the gradient of the prior (alias of get_gradient())."""
+
+        return self.get_gradient(image)
 
     def set_up(self, image):
         """Sets up."""
@@ -1982,6 +2094,72 @@ class QuadraticPrior(Prior):
         """del."""
         if self.handle is not None:
             pyiutil.deleteDataHandle(self.handle)
+
+    def set_kappa(self, image):
+        """Sets kappa."""
+        assert_validity(image, ImageData)
+        parms.set_parameter(self.handle, 'QuadraticPrior', 'kappa', image.handle)
+
+    def get_kappa(self):
+        """Returns kappa."""
+        image = ImageData()
+        image.handle = pystir.cSTIR_parameter(self.handle, 'QuadraticPrior', 'kappa')
+        check_status(image.handle)
+        return image
+
+
+class RelativeDifferencePrior(Prior):
+    r"""Class for the prior that is the relative difference prior.
+
+    J. Nuyts, D. Beque, P. Dupont, and L. Mortelmans, "A Concave 
+    Prior Penalizing Relative Differences for Maximum-a-Posteriori 
+    Reconstruction in Emission Tomography," vol. 49, no. 1, pp. 
+    56-60, 2002.
+
+    gamma
+    eps
+    kappa
+    """
+
+    def __init__(self):
+        """init."""
+        self.handle = None
+        self.name = 'RelativeDifferencePrior'
+        self.handle = pystir.cSTIR_newObject(self.name)
+        check_status(self.handle)
+
+    def __del__(self):
+        """del."""
+        if self.handle is not None:
+            pyiutil.deleteDataHandle(self.handle)
+
+    def set_gamma(self, v):
+        """Sets gamma."""
+        parms.set_float_par(self.handle, 'RelativeDifferencePrior', 'gamma', v)
+
+    def get_gamma(self):
+        """Returns gamma."""
+        return parms.float_par(self.handle, 'RelativeDifferencePrior', 'gamma')
+
+    def set_epsilon(self, v):
+        """Sets epsilon."""
+        parms.set_float_par(self.handle, 'RelativeDifferencePrior', 'epsilon', v)
+
+    def get_epsilon(self):
+        """Returns epsilon."""
+        return parms.float_par(self.handle, 'RelativeDifferencePrior', 'epsilon')
+
+    def set_kappa(self, image):
+        """Sets kappa."""
+        assert_validity(image, ImageData)
+        parms.set_parameter(self.handle, 'RelativeDifferencePrior', 'kappa', image.handle)
+
+    def get_kappa(self):
+        """Returns kappa."""
+        image = ImageData()
+        image.handle = pystir.cSTIR_parameter(self.handle, 'RelativeDifferencePrior', 'kappa')
+        check_status(image.handle)
+        return image
 
 
 class PLSPrior(Prior):
